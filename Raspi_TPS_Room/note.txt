@@ -1,0 +1,4 @@
+VNC : 
+- username : raspi_server_energy
+- password : raspberrypi
+
