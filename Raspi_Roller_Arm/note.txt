@@ -1,0 +1,3 @@
+VNC : 
+- username : raspi_server_tps
+- password : raspberrypi
