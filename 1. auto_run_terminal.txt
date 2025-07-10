@@ -1,0 +1,9 @@
+[1]
+mkdir -p ~/.config/autostart
+nano ~/.config/autostart/terminal.desktop
+
+[2]
+[Desktop Entry]
+Name=Terminal
+Exec=lxterminal
+Type=Application
