@@ -1,10 +1,23 @@
+#!/usr/bin/env python3
 import time
 import struct
 import math
 import pymysql
-from pymodbus.client.sync import ModbusSerialClient as ModbusClient
+from pymodbus.client import ModbusSerialClient as ModbusClient
 from datetime import datetime
 import serial
+import logging
+from typing import Dict, Optional, List, Tuple, Union
+
+# Konfigurasi Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s: %(message)s',
+    handlers=[
+        logging.FileHandler("energy_monitor.log"),
+        logging.StreamHandler()
+    ]
+)
 
 # Konfigurasi Serial untuk ESP32 (GPIO UART)
 SERIAL_PORT_ESP = '/dev/ttyAMA0'
@@ -24,108 +37,94 @@ DB_USER = 'otics'
 DB_PASSWORD = 'tuanku'
 DB_NAME = 'database_energy_area_compressor'
 
-# Define Registers
-REGISTER_POWER = [
-    (3203, "active_energy_delivered"),
+# Define Registers - Hanya register yang diperlukan
+REGISTER_POWER: List[Tuple[int, str]] = [
+    (3203, "active_energy_delivered"),  # WH yang dihitung untuk pembayaran PLN
     (3207, "active_energy_received"),
-    (3211, "active_energy_delivered_received"),
-    (3215, "active_energy_delivered_minus_received"),
-    (3219, "reactive_energy_delivered"),
-    (3223, "reactive_energy_received"),
-    (3227, "reactive_energy_delivered_received"),
-    (3231, "reactive_energy_delivered_minus_received"),
-    (3235, "apparent_energy_delivered"),
-    (3239, "apparent_energy_received"),
-    (3243, "apparent_energy_delivered_received"),
-    (3247, "apparent_energy_delivered_minus_received")
+    (3215, "active_energy_delivered_minus_received")
 ]
 
-FLOAT32_REGISTERS = [
-    (2999, "current_a"),
-    (3001, "current_b"),
-    (3003, "current_c"),
-    (3005, "current_n"),
+FLOAT32_REGISTERS: List[Tuple[int, str]] = [
     (3009, "current_avg"),
-    (3019, "voltage_ab"),
-    (3021, "voltage_bc"),
-    (3023, "voltage_ca"),
-    (3025, "voltage_ll_avg"),
-    (3027, "voltage_an"),
-    (3029, "voltage_bn"),
-    (3031, "voltage_cn"),
     (3035, "voltage_ln_avg"),
-    (3053, "active_power_a"),
-    (3055, "active_power_b"),
-    (3057, "active_power_c"),
     (3059, "active_power_total"),
-    (3061, "reactive_power_a"),
-    (3063, "reactive_power_b"),
-    (3065, "reactive_power_c"),
-    (3067, "reactive_power_total"),
-    (3069, "apparent_power_a"),
-    (3071, "apparent_power_b"),
-    (3073, "apparent_power_c"),
-    (3075, "apparent_power_total"),
-    (3077, "power_factor_a"),
-    (3079, "power_factor_b"),
-    (3081, "power_factor_c"),
-    (3083, "power_factor_total"),
     (3109, "frequency")
 ]
 
-REGISTER_DATETIME = [
+REGISTER_DATETIME: List[Tuple[int, str]] = [
     (1836, "year"),
     (1837, "month"),
     (1838, "day"),
     (1839, "hour"),
     (1840, "minute"),
-    (1841, "second"),
-    (1842, "millisecond")
+    (1841, "second")
 ]
 
-# Inisialisasi koneksi serial ke ESP32
-try:
-    ser_esp = serial.Serial(
-        port=SERIAL_PORT_ESP,
-        baudrate=SERIAL_BAUDRATE_ESP,
-        parity=serial.PARITY_NONE,
-        stopbits=serial.STOPBITS_ONE,
-        bytesize=serial.EIGHTBITS,
-        timeout=1
+# Global variables
+client: ModbusClient = None
+db_connection: pymysql.Connection = None
+ser_esp: serial.Serial = None
+
+def initialize_serial_esp32() -> bool:
+    """Initialize ESP32 serial connection"""
+    global ser_esp
+    try:
+        ser_esp = serial.Serial(
+            port=SERIAL_PORT_ESP,
+            baudrate=SERIAL_BAUDRATE_ESP,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            bytesize=serial.EIGHTBITS,
+            timeout=1
+        )
+        logging.info(f"ESP32 serial port {SERIAL_PORT_ESP} initialized at {SERIAL_BAUDRATE_ESP} baud")
+        return True
+    except serial.SerialException as e:
+        logging.error(f"Failed to initialize ESP32 serial port: {e}")
+        return False
+
+def initialize_modbus_client() -> ModbusClient:
+    """Initialize and return Modbus client"""
+    return ModbusClient(
+        method='rtu',
+        port=MODBUS_PORT,
+        baudrate=MODBUS_BAUDRATE,
+        parity=MODBUS_PARITY,
+        stopbits=MODBUS_STOPBITS,
+        bytesize=MODBUS_BYTESIZE,
+        timeout=3
     )
-    print(f"ESP32 serial port {SERIAL_PORT_ESP} initialized at {SERIAL_BAUDRATE_ESP} baud")
-except serial.SerialException as e:
-    print(f"Failed to initialize ESP32 serial port: {e}")
-    ser_esp = None
 
-# Inisialisasi Modbus Client (RTU via USB)
-client = ModbusClient(
-    method='rtu',
-    port=MODBUS_PORT,
-    baudrate=MODBUS_BAUDRATE,
-    parity=MODBUS_PARITY,
-    stopbits=MODBUS_STOPBITS,
-    bytesize=MODBUS_BYTESIZE,
-    timeout=3
-)
+def connect_database() -> bool:
+    """Connect to MySQL database"""
+    global db_connection
+    try:
+        db_connection = pymysql.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database=DB_NAME,
+            autocommit=True
+        )
+        logging.info("Connected to MySQL database")
+        return True
+    except pymysql.MySQLError as e:
+        logging.error(f"Database connection error: {e}")
+        return False
 
-# Connect to MySQL
-db_connection = pymysql.connect(
-    host=DB_HOST,
-    user=DB_USER,
-    password=DB_PASSWORD,
-    database=DB_NAME
-)
-
-def get_current_table_name():
+def get_current_table_name() -> str:
     """Generate the table name based on the current month and year."""
     now = datetime.now()
     month = now.strftime("%b").lower()
     year = now.strftime("%Y")
     return f"table_energy_listrik_otics_{month}_{year}"
 
-def create_table_if_not_exists(table_name):
-    """Create the table with complete structure if it doesn't exist."""
+def create_table_if_not_exists(table_name: str) -> bool:
+    """Create the table with simplified structure"""
+    if not db_connection:
+        if not connect_database():
+            return False
+
     cursor = db_connection.cursor()
     
     sql = f"""
@@ -134,119 +133,117 @@ def create_table_if_not_exists(table_name):
         `timestamp` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         `active_energy_delivered` BIGINT,
         `active_energy_received` BIGINT,
-        `active_energy_delivered_received` BIGINT,
         `active_energy_delivered_minus_received` BIGINT,
-        `reactive_energy_delivered` BIGINT,
-        `reactive_energy_received` BIGINT,
-        `reactive_energy_delivered_received` BIGINT,
-        `reactive_energy_delivered_minus_received` BIGINT,
-        `apparent_energy_delivered` BIGINT,
-        `apparent_energy_received` BIGINT,
-        `apparent_energy_delivered_received` BIGINT,
-        `apparent_energy_delivered_minus_received` BIGINT,
-        `current_a` FLOAT,
-        `current_b` FLOAT,
-        `current_c` FLOAT,
-        `current_n` FLOAT,
-        `current_g` FLOAT,
         `current_avg` FLOAT,
-        `voltage_ab` FLOAT,
-        `voltage_bc` FLOAT,
-        `voltage_ca` FLOAT,
-        `voltage_ll_avg` FLOAT,
-        `voltage_an` FLOAT,
-        `voltage_bn` FLOAT,
-        `voltage_cn` FLOAT,
         `voltage_ln_avg` FLOAT,
-        `active_power_a` FLOAT,
-        `active_power_b` FLOAT,
-        `active_power_c` FLOAT,
         `active_power_total` FLOAT,
-        `reactive_power_a` FLOAT,
-        `reactive_power_b` FLOAT,
-        `reactive_power_c` FLOAT,
-        `reactive_power_total` FLOAT,
-        `apparent_power_a` FLOAT,
-        `apparent_power_b` FLOAT,
-        `apparent_power_c` FLOAT,
-        `apparent_power_total` FLOAT,
-        `power_factor_a` FLOAT,
-        `power_factor_b` FLOAT,
-        `power_factor_c` FLOAT,
-        `power_factor_total` FLOAT,
         `frequency` FLOAT,
         `year` INT,
         `month` TINYINT,
         `day` TINYINT,
         `hour` TINYINT,
         `minute` TINYINT,
-        `second` TINYINT,
-        `millisecond` SMALLINT
+        `second` TINYINT
     );
     """
     
     try:
         cursor.execute(sql)
         db_connection.commit()
-        print(f"Table '{table_name}' created or already exists.")
+        logging.info(f"Table '{table_name}' created or already exists.")
+        return True
     except pymysql.MySQLError as e:
-        print(f"Error creating table '{table_name}':", e)
-        db_connection.rollback()
+        logging.error(f"Error creating table '{table_name}': {e}")
+        return False
     finally:
         cursor.close()
 
-def read_modbus_register(address, count, is_float=False):
-    """Membaca register Modbus dengan penanganan error"""
-    try:
-        response = client.read_holding_registers(address, count, unit=UNIT_ID)
-        
-        if response.isError():
-            print(f"Modbus error: {response}")
-            return None
-        
-        return response.registers
+def connect_modbus() -> bool:
+    """Connect to Modbus device with retry"""
+    global client
+    if client is None:
+        client = initialize_modbus_client()
     
+    try:
+        if not client.connected:
+            if not client.connect():
+                logging.error("Modbus connection failed")
+                return False
+        return True
     except Exception as e:
-        print(f"Exception reading register {address}: {e}")
-        return None
+        logging.error(f"Modbus connection error: {e}")
+        return False
 
-def fetch_modbus_data():
-    data = {}
+def read_modbus_register(address: int, count: int, is_float: bool = False, retries: int = 3) -> Optional[Union[List[int], float]]:
+    """Read Modbus register with error handling and retry"""
+    for attempt in range(retries):
+        try:
+            if not connect_modbus():
+                time.sleep(1)
+                continue
+                
+            response = client.read_holding_registers(address, count, unit=UNIT_ID)
+            
+            if response.isError():
+                logging.warning(f"Modbus error ({attempt+1}/{retries}): {response}")
+                time.sleep(0.5)
+                continue
+                
+            registers = response.registers
+            
+            if not is_float:
+                return registers
+                
+            # Handle float conversion
+            if len(registers) != 2:
+                logging.error(f"Expected 2 registers for float, got {len(registers)}")
+                return None
+                
+            # Check for invalid values
+            if registers[0] == 0xFFFF and registers[1] == 0xFFFF:
+                return None
+                
+            byte_data = struct.pack('>HH', registers[0], registers[1])
+            float_value = struct.unpack('>f', byte_data)[0]
+            
+            if math.isinf(float_value) or math.isnan(float_value):
+                return None
+                
+            return float_value
+            
+        except Exception as e:
+            logging.error(f"Exception reading register {address} ({attempt+1}/{retries}): {e}")
+            time.sleep(1)
+    
+    logging.error(f"Failed after {retries} attempts for register {address}")
+    return None
+
+def fetch_modbus_data() -> Optional[Dict[str, Union[int, float]]]:
+    """Fetch all Modbus data with error handling"""
+    data: Dict[str, Union[int, float]] = {}
 
     # Read power registers (64-bit values)
     for address, name in REGISTER_POWER:
         registers = read_modbus_register(address, 4)
         if registers and len(registers) == 4:
             try:
-                # Gabungkan 4 register menjadi 64-bit integer
+                # Combine 4 registers into 64-bit integer
                 int64_value = (registers[0] << 48) | (registers[1] << 32) | (registers[2] << 16) | registers[3]
                 data[name] = int64_value
             except Exception as e:
-                print(f"Error converting registers to int64: {e}")
+                logging.error(f"Error converting registers to int64 for {name}: {e}")
                 data[name] = None
         else:
-            print(f"Error reading {name} at address {address}")
+            logging.warning(f"Error reading {name} at address {address}")
             data[name] = None
 
     # Read float32 registers
     for address, name in FLOAT32_REGISTERS:
-        registers = read_modbus_register(address, 2)
-        if registers and len(registers) == 2:
-            try:
-                # Konversi 2 register menjadi float
-                byte_data = struct.pack('>HH', registers[0], registers[1])
-                float_value = struct.unpack('>f', byte_data)[0]
-                
-                if math.isnan(float_value):
-                    print(f"NaN detected for {name} at address {address}")
-                    data[name] = None
-                else:
-                    data[name] = float_value
-            except Exception as e:
-                print(f"Error converting registers to float: {e}")
-                data[name] = None
+        float_value = read_modbus_register(address, 2, is_float=True)
+        if float_value is not None:
+            data[name] = float_value
         else:
-            print(f"Error reading {name} at address {address}")
+            logging.warning(f"Error reading {name} at address {address}")
             data[name] = None
 
     # Read datetime registers
@@ -255,20 +252,53 @@ def fetch_modbus_data():
         if registers:
             data[name] = registers[0]
         else:
-            print(f"Error reading {name} at address {address}")
+            logging.warning(f"Error reading {name} at address {address}")
             data[name] = None
 
     return data
 
-def insert_data_into_db(data):
-    """Insert data into the appropriate table."""
-    table_name = get_current_table_name()
-    create_table_if_not_exists(table_name)
-
-    cursor = db_connection.cursor()
+def validate_data(data: Dict[str, Union[int, float]]) -> bool:
+    """Validate essential values before saving"""
+    required_keys = [
+        'active_energy_delivered',  # Data WH untuk pembayaran PLN
+        'voltage_ln_avg', 
+        'active_power_total',
+        'year',
+        'month'
+    ]
     
-    # Tambahkan current_g sebagai NULL
-    data['current_g'] = None
+    for key in required_keys:
+        if data.get(key) is None:
+            logging.warning(f"Missing required value: {key}")
+            return False
+            
+    # Validate value ranges
+    if data['voltage_ln_avg'] < 100 or data['voltage_ln_avg'] > 300:
+        logging.warning(f"Invalid voltage: {data['voltage_ln_avg']}")
+        return False
+        
+    if data['active_power_total'] < 0:
+        logging.warning(f"Invalid power: {data['active_power_total']}")
+        return False
+        
+    return True
+
+def insert_data_into_db(data: Dict[str, Union[int, float]]) -> bool:
+    """Insert data into the appropriate table with error handling"""
+    global db_connection
+    
+    # Check database connection
+    try:
+        db_connection.ping(reconnect=True)
+    except Exception:
+        if not connect_database():
+            return False
+    
+    table_name = get_current_table_name()
+    if not create_table_if_not_exists(table_name):
+        return False
+    
+    cursor = db_connection.cursor()
     
     # Prepare data for insertion
     columns = ', '.join([f"`{key}`" for key in data.keys()])
@@ -278,75 +308,136 @@ def insert_data_into_db(data):
     try:
         cursor.execute(sql, list(data.values()))
         db_connection.commit()
-        print("Data inserted successfully into table:", table_name)
-        
-        # Kirim data ke ESP32 setelah berhasil disimpan
-        send_to_esp32(data)
-        
+        logging.info(f"Data inserted successfully into {table_name}")
+        return True
     except pymysql.MySQLError as e:
-        print("Error inserting data:", e)
-        db_connection.rollback()
+        logging.error(f"Error inserting data: {e}")
+        return False
     finally:
         cursor.close()
 
-def send_to_esp32(data):
-    """Kirim data penting ke ESP32 melalui serial"""
-    if ser_esp and ser_esp.is_open:
+def send_to_esp32(data: Dict[str, Union[int, float]]) -> bool:
+    """Send WH data to ESP32 in required format: *KUB2,DATA WH,DATA WATT,#"""
+    global ser_esp
+    
+    if ser_esp is None:
+        if not initialize_serial_esp32():
+            return False
+            
+    if not ser_esp.is_open:
         try:
-            # Format data yang akan dikirim (contoh: data power total)
-            power_total = data.get('active_power_total', 0)
-            message = f"PWR:{power_total:.2f}\n"
-            
-            ser_esp.write(message.encode('utf-8'))
-            print(f"Sent to ESP32: {message.strip()}")
-            
-            # Tunggu dan baca respon jika ada
-            response = ser_esp.readline().decode('utf-8').strip()
-            if response:
-                print(f"Received from ESP32: {response}")
-                
+            ser_esp.open()
         except serial.SerialException as e:
-            print(f"Error sending to ESP32: {e}")
+            logging.error(f"Failed to open ESP32 serial: {e}")
+            return False
+    
+    try:
+        # Format data to send
+        wh_data = data.get('active_energy_delivered', 0)  # Data WH untuk pembayaran PLN
+        watt_data = data.get('active_power_total', 0)     # Data Watt
+        
+        # Format: *KUB2,DATA WH,DATA WATT,#
+        message = f"*KUB2,{wh_data},{watt_data},#\n"
+        
+        ser_esp.write(message.encode('utf-8'))
+        logging.info(f"Sent to ESP32: {message.strip()}")
+        
+        # Wait for response with timeout
+        start = time.time()
+        while time.time() - start < 0.5:
+            if ser_esp.in_waiting > 0:
+                response = ser_esp.readline().decode('utf-8').strip()
+                if response:
+                    logging.info(f"ESP32 response: {response}")
+                break
+                
+        return True
+    except serial.SerialException as e:
+        logging.error(f"ESP32 communication error: {e}")
+        try:
+            ser_esp.close()
+        except:
+            pass
+        return False
+
+def cleanup():
+    """Clean up all resources"""
+    logging.info("Cleaning up resources...")
+    
+    if client and client.connected:
+        client.close()
+        logging.info("Modbus connection closed")
+    
+    if db_connection:
+        db_connection.close()
+        logging.info("Database connection closed")
+    
+    if ser_esp and ser_esp.is_open:
+        ser_esp.close()
+        logging.info("ESP32 serial port closed")
 
 def main():
+    """Main program loop"""
     try:
-        # Buka koneksi Modbus
-        if not client.connect():
-            print("Modbus connection failed.")
+        # Initialize connections
+        if not initialize_serial_esp32():
+            logging.warning("ESP32 serial not available, continuing without it")
+            
+        if not connect_database():
+            logging.error("Failed to connect to database")
             return
+            
+        if not connect_modbus():
+            logging.error("Failed to connect to Modbus device")
+            return
+            
+        logging.info("Energy monitoring system started")
+        logging.info(f"Modbus port: {MODBUS_PORT}")
+        logging.info(f"Modbus baudrate: {MODBUS_BAUDRATE}")
         
-        print("Starting energy monitoring system with Modbus RTU...")
-        print(f"Modbus port: {MODBUS_PORT}")
-        print(f"Modbus baudrate: {MODBUS_BAUDRATE}")
-        print("Press Ctrl+C to stop the program")
+        cycle_count = 0
+        last_success_time = time.time()
         
         while True:
-            print("\nReading Modbus data...")
-            start_time = time.time()
+            cycle_start = time.time()
+            cycle_count += 1
+            logging.info(f"\nStarting cycle #{cycle_count}")
+            
+            # Read Modbus data
             data = fetch_modbus_data()
-            
-            if data:
-                print("Data fetched successfully. Inserting into database...")
-                insert_data_into_db(data)
-                elapsed = time.time() - start_time
-                print(f"Cycle completed in {elapsed:.2f} seconds")
+            if not data:
+                logging.warning("No data received from Modbus")
+                time.sleep(10)
+                continue
+                
+            # Validate and save data
+            if validate_data(data):
+                if insert_data_into_db(data):
+                    last_success_time = time.time()
+                    send_to_esp32(data)  # Kirim data ke ESP32
+                else:
+                    logging.warning("Failed to save data to database")
             else:
-                print("No data fetched from Modbus registers.")
+                logging.warning("Invalid data skipped")
+                
+            # Calculate sleep time (10 seconds between cycles)
+            elapsed = time.time() - cycle_start
+            sleep_time = max(0, 10 - elapsed)
             
-            time.sleep(10)
+            # Log system status
+            uptime = time.time() - last_success_time
+            logging.info(f"Cycle completed in {elapsed:.2f}s. Uptime: {uptime:.1f}s")
             
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+                
     except KeyboardInterrupt:
-        print("\nProgram stopped by user")
+        logging.info("\nProgram stopped by user")
     except Exception as e:
-        print("An error occurred:", e)
+        logging.exception("Unexpected error in main loop")
     finally:
-        print("Closing connections...")
-        client.close()
-        db_connection.close()
-        if ser_esp and ser_esp.is_open:
-            ser_esp.close()
-            print("ESP32 serial port closed")
-        print("All connections closed. Exiting program.")
+        cleanup()
+        logging.info("Program exited")
 
 if __name__ == "__main__":
     main()
