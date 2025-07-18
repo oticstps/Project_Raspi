@@ -2,17 +2,20 @@ import time
 import struct
 import math
 import pymysql
-from pymodbus.client import ModbusTcpClient
+from pymodbus.client.sync import ModbusSerialClient as ModbusClient
 from datetime import datetime
 import serial
 
-# Konfigurasi Serial untuk ESP32
-SERIAL_PORT = '/dev/ttyAMA0'
-SERIAL_BAUDRATE = 115200
+# Konfigurasi Serial untuk ESP32 (GPIO UART)
+SERIAL_PORT_ESP = '/dev/ttyAMA0'
+SERIAL_BAUDRATE_ESP = 115200
 
-# Modbus Configuration
-MODBUS_HOST = '169.254.0.10'
-MODBUS_PORT = 502
+# Konfigurasi Modbus RTU via USB
+MODBUS_PORT = '/dev/ttyUSB0'
+MODBUS_BAUDRATE = 9600
+MODBUS_PARITY = 'N'
+MODBUS_STOPBITS = 1
+MODBUS_BYTESIZE = 8
 UNIT_ID = 1
 
 # MySQL Database Configuration
@@ -80,23 +83,33 @@ REGISTER_DATETIME = [
     (1842, "millisecond")
 ]
 
-# Inisialisasi koneksi serial
+# Inisialisasi koneksi serial ke ESP32
 try:
     ser_esp = serial.Serial(
-        port=SERIAL_PORT,
-        baudrate=SERIAL_BAUDRATE,
+        port=SERIAL_PORT_ESP,
+        baudrate=SERIAL_BAUDRATE_ESP,
         parity=serial.PARITY_NONE,
         stopbits=serial.STOPBITS_ONE,
         bytesize=serial.EIGHTBITS,
         timeout=1
     )
-    print(f"Serial port {SERIAL_PORT} initialized at {SERIAL_BAUDRATE} baud")
+    print(f"ESP32 serial port {SERIAL_PORT_ESP} initialized at {SERIAL_BAUDRATE_ESP} baud")
 except serial.SerialException as e:
-    print(f"Failed to initialize serial port: {e}")
+    print(f"Failed to initialize ESP32 serial port: {e}")
     ser_esp = None
 
-# Connect to Modbus and MySQL
-client = ModbusTcpClient(MODBUS_HOST, port=MODBUS_PORT)
+# Inisialisasi Modbus Client (RTU via USB)
+client = ModbusClient(
+    method='rtu',
+    port=MODBUS_PORT,
+    baudrate=MODBUS_BAUDRATE,
+    parity=MODBUS_PARITY,
+    stopbits=MODBUS_STOPBITS,
+    bytesize=MODBUS_BYTESIZE,
+    timeout=3
+)
+
+# Connect to MySQL
 db_connection = pymysql.connect(
     host=DB_HOST,
     user=DB_USER,
@@ -182,43 +195,67 @@ def create_table_if_not_exists(table_name):
     finally:
         cursor.close()
 
+def read_modbus_register(address, count, is_float=False):
+    """Membaca register Modbus dengan penanganan error"""
+    try:
+        response = client.read_holding_registers(address, count, unit=UNIT_ID)
+        
+        if response.isError():
+            print(f"Modbus error: {response}")
+            return None
+        
+        return response.registers
+    
+    except Exception as e:
+        print(f"Exception reading register {address}: {e}")
+        return None
+
 def fetch_modbus_data():
     data = {}
 
-    # Read power registers
+    # Read power registers (64-bit values)
     for address, name in REGISTER_POWER:
-        response = client.read_holding_registers(address, 4, slave=UNIT_ID)
-        if not response.isError():
-            registers = response.registers
-            int64_value = struct.unpack('>Q', struct.pack('>HHHH', *registers))[0]
-            data[name] = int64_value
+        registers = read_modbus_register(address, 4)
+        if registers and len(registers) == 4:
+            try:
+                # Gabungkan 4 register menjadi 64-bit integer
+                int64_value = (registers[0] << 48) | (registers[1] << 32) | (registers[2] << 16) | registers[3]
+                data[name] = int64_value
+            except Exception as e:
+                print(f"Error converting registers to int64: {e}")
+                data[name] = None
         else:
-            print(f"Error reading {name} at address {address}: {response}")
+            print(f"Error reading {name} at address {address}")
             data[name] = None
 
     # Read float32 registers
     for address, name in FLOAT32_REGISTERS:
-        response = client.read_holding_registers(address, 2, slave=UNIT_ID)
-        if not response.isError():
-            registers = response.registers
-            float_value = struct.unpack('!f', struct.pack('>HH', *registers))[0]
-            if math.isnan(float_value):
-                print(f"NaN detected for {name} at address {address}. Setting value to None.")
+        registers = read_modbus_register(address, 2)
+        if registers and len(registers) == 2:
+            try:
+                # Konversi 2 register menjadi float
+                byte_data = struct.pack('>HH', registers[0], registers[1])
+                float_value = struct.unpack('>f', byte_data)[0]
+                
+                if math.isnan(float_value):
+                    print(f"NaN detected for {name} at address {address}")
+                    data[name] = None
+                else:
+                    data[name] = float_value
+            except Exception as e:
+                print(f"Error converting registers to float: {e}")
                 data[name] = None
-            else:
-                data[name] = float_value
         else:
-            print(f"Error reading {name} at address {address}: {response}")
+            print(f"Error reading {name} at address {address}")
             data[name] = None
 
     # Read datetime registers
     for address, name in REGISTER_DATETIME:
-        response = client.read_holding_registers(address, 1, slave=UNIT_ID)
-        if not response.isError():
-            int_value = response.registers[0]
-            data[name] = int_value
+        registers = read_modbus_register(address, 1)
+        if registers:
+            data[name] = registers[0]
         else:
-            print(f"Error reading {name} at address {address}: {response}")
+            print(f"Error reading {name} at address {address}")
             data[name] = None
 
     return data
@@ -273,11 +310,14 @@ def send_to_esp32(data):
 
 def main():
     try:
+        # Buka koneksi Modbus
         if not client.connect():
             print("Modbus connection failed.")
             return
         
-        print("Starting energy monitoring system with ESP32 communication...")
+        print("Starting energy monitoring system with Modbus RTU...")
+        print(f"Modbus port: {MODBUS_PORT}")
+        print(f"Modbus baudrate: {MODBUS_BAUDRATE}")
         print("Press Ctrl+C to stop the program")
         
         while True:
@@ -305,7 +345,7 @@ def main():
         db_connection.close()
         if ser_esp and ser_esp.is_open:
             ser_esp.close()
-            print("Serial port closed")
+            print("ESP32 serial port closed")
         print("All connections closed. Exiting program.")
 
 if __name__ == "__main__":
